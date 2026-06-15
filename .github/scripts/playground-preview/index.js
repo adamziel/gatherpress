@@ -1,33 +1,102 @@
-const fs = require('fs');
-const path = require('path');
+/**
+ * Gets the PR body and parses a Blueprint override from it.
+ *
+ * @param {object} github - An authenticated GitHub API instance.
+ * @param {object} context - The context of the event.
+ * @param {number} prNumber - Pull request number.
+ * @returns {Promise<object|null>} Parsed override object, or null if not found / invalid.
+ */
+async function loadBlueprintOverride(github, context, prNumber) {
+	const { data: pullRequest } = await github.rest.pulls.get({
+		owner: context.repo.owner,
+		repo: context.repo.repo,
+		pull_number: prNumber,
+	});
+
+	return loadBlueprintOverrideFromPullRequestBody(pullRequest.body);
+}
 
 /**
- * Attempts to read and parse a per-PR blueprint override file.
+ * Attempts to read and parse a per-PR blueprint override from the PR body.
  *
- * The file is looked up at `.github/playground/PR-123-blueprint-override.json`
- * in the checked-out PR branch code. When called from `workflow_run`,
- * this requires a separate checkout of the PR head ref (see workflow
- * changes below).
+ * The override must live in a collapsed details block whose summary contains
+ * "Playground Blueprint", with the JSON stored in a fenced json code block.
  *
- * @param {string} [filePath] - Path to the override file.
+ * @param {string} body - Pull request body text.
  * @returns {object|null} - Parsed override object, or null if not found / invalid.
  */
-function loadBlueprintOverride(filePath) {
-	try {
-		if (!fs.existsSync(filePath)) {
-			console.log(`No blueprint override found at ${filePath}`);
-			return null;
-		}
+function loadBlueprintOverrideFromPullRequestBody(body) {
+	const detailsBlock = findBlueprintDetailsBlock(body || '');
 
-		const raw = fs.readFileSync(filePath, 'utf8');
-		const override = JSON.parse(raw);
-
-		console.log(`Loaded blueprint override from ${filePath}`);
-		return override;
-	} catch (err) {
-		console.warn(`Warning: Failed to load blueprint override: ${err.message}`);
+	if (!detailsBlock) {
 		return null;
 	}
+
+	const raw = extractJsonCodeBlock(detailsBlock);
+
+	if (!raw) {
+		return null;
+	}
+
+	try {
+		const override = JSON.parse(raw);
+
+		return override;
+	} catch (err) {
+		console.warn(
+			`Warning: Failed to load blueprint override from the PR description: ${err.message}`
+		);
+		return null;
+	}
+}
+
+/**
+ * Finds the collapsed details block used for the PR Blueprint override.
+ *
+ * @param {string} body - Pull request body text.
+ * @returns {string|null} The details block contents, or null when absent.
+ */
+function findBlueprintDetailsBlock(body) {
+	const detailsPattern = /<details\b[^>]*>([\s\S]*?)<\/details>/gi;
+	let detailsMatch;
+
+	while ((detailsMatch = detailsPattern.exec(body))) {
+		const details = detailsMatch[1];
+		const summaryMatch = details.match(
+			/<summary\b[^>]*>([\s\S]*?)<\/summary>/i
+		);
+
+		if (!summaryMatch) {
+			continue;
+		}
+
+		const summary = summaryMatch[1].replace(/<[^>]+>/g, '').trim();
+
+		if (/\bplayground\s+blueprint\b/i.test(summary)) {
+			return details;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Extracts the first JSON fenced code block from a details block.
+ *
+ * @param {string} detailsBlock - Details block contents.
+ * @returns {string|null} Code block contents, or null when absent.
+ */
+function extractJsonCodeBlock(detailsBlock) {
+	const codeBlockPattern = /```json\s*([\s\S]*?)```/i;
+	const codeBlockMatch = detailsBlock.match(codeBlockPattern);
+
+	if (!codeBlockMatch) {
+		return null;
+	}
+
+	const code = codeBlockMatch[1].trim();
+
+	return code || null;
 }
 
 /**
@@ -148,7 +217,7 @@ function createBlueprintUrl(context, number) {
  * @param {number} number - The PR number where the plugin changes are located.
  * @param {string} zipArtifactUrl - The URL where the built plugin artifact can be downloaded.
  * @param {string} phpVersion - The PHP version to use in the WordPress Playground.
- * @param {object|null} override - Optional override loaded from the PR branch.
+ * @param {object|null} override - Optional override loaded from the PR description.
  * @returns {string} - A JSON string representing the blueprint.
  */
 function createBlueprint(context, number, zipArtifactUrl, phpVersion, override) {
@@ -257,7 +326,7 @@ function createBlueprint(context, number, zipArtifactUrl, phpVersion, override) 
 		],
 	};
 
-	// Apply override if provided
+	// Apply override if provided.
 	if (override) {
 		const sanitized = sanitizeOverride(override);
 		mergeOverride(template, sanitized);
@@ -294,17 +363,12 @@ function createPlaygroundLinks( blueprint, prText) {
  * @param {object} context - The context of the event.
  * @param {number} [prNumberOverride] - Explicit PR number; required when called from a workflow_run
  *   context where context.payload.pull_request is not present.
- * @param {string} [filePath] - Path to the blueprint override file (for testing or
- *   when the PR head is checked out to a non-default location).
  */
-async function createPreviewLinksComment(github, context, prNumberOverride, filePath) {
+async function createPreviewLinksComment(github, context, prNumberOverride) {
 	const prNumber       = prNumberOverride ?? context.payload.pull_request.number;
 	const zipArtifactUrl = createBlueprintUrl(context.repo, prNumber);  // URL to the built plugin artifact
 	const prText         = `for PR#${prNumber}`;  // Descriptive text for the PR
-
-	// Load per-PR override
-	const overridePath = filePath + 'PR-' + prNumber + '-blueprint-override.json';
-	const override = loadBlueprintOverride(overridePath);
+	const override       = await loadBlueprintOverride(github, context, prNumber);
 
 	// Retrieve PHP versions from environment variable (JSON string)
 	const phpVersionsEnv = process.env.PHP_VERSIONS || '["8.4","8.2","7.4"]';  // Default to common versions if not set.
@@ -322,16 +386,19 @@ async function createPreviewLinksComment(github, context, prNumberOverride, file
 		previewLinks        += `\n${versionHeading}\n${versionLinks}`;
 	}
 
+	const docsUrl = 'https://github.com/GatherPress/gatherpress/blob/develop/' +
+		'docs/contributor/playground-pr-preview/README.md#customize-your-pr-playground';
+
 	const overrideNote = override
 		? `
-ℹ️ This preview includes a custom blueprint override from <code>.github/playground/PR-${prNumber}-blueprint-override.json</code>.
+ℹ️ This preview includes a custom blueprint override from the PR description's
+<code>Playground Blueprint</code> details block.
 `
 		: `
 <details><summary>Customize PR Playground</summary>
 
-To customize the Playground preview for this specific PR, create a file at:
-
-<code>.github/playground/PR-${prNumber}-blueprint-override.json</code>
+To customize the Playground preview for this specific PR, add a collapsed
+<code>Playground Blueprint</code> details block to the PR description.
 
 The override is merged into the generated blueprint and can be used to:
 
@@ -341,6 +408,10 @@ The override is merged into the generated blueprint and can be used to:
 - Run steps before or after the GatherPress' default steps
 
 Example:
+
+\`\`\`\`md
+<details>
+<summary>Playground Blueprint</summary>
 
 \`\`\`json
 {
@@ -372,9 +443,12 @@ Example:
 	]
 }
 \`\`\`
+
+</details>
+\`\`\`\`
 </details>
 
-Go to [Playground PR preview customization](https://github.com/GatherPress/gatherpress/blob/develop/docs/contributor/playground-pr-preview/README.md#customize-your-pr-playground) for more details.
+Go to [Playground PR preview customization](${docsUrl}) for more details.
 `;
 
 	// The title of the comment and its content, including preview links for all PHP versions.
